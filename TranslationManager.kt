@@ -2,6 +2,10 @@ package com.example.screencapture
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.ColorMatrix
+import android.graphics.ColorMatrixColorFilter
+import android.graphics.Paint
 import android.util.Log
 import android.util.LruCache
 import com.google.mlkit.common.model.DownloadConditions
@@ -10,6 +14,7 @@ import com.google.mlkit.nl.translate.Translation
 import com.google.mlkit.nl.translate.Translator
 import com.google.mlkit.nl.translate.TranslatorOptions
 import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.Text
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.TextRecognizer
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
@@ -47,6 +52,7 @@ class TranslationManager(
         .build()
 
     private val mlKitTranslator: Translator = Translation.getClient(translatorOptions)
+    val ttsManager = TextToSpeechManager(context)
 
     private var isReleased = false
 
@@ -64,11 +70,13 @@ class TranslationManager(
         }
     }
 
-    suspend fun recognizeAndTranslate(bitmap: Bitmap): String = withContext(Dispatchers.Default) {
-        if (isReleased || bitmap.isRecycled) return@withContext ""
-
+    /**
+     * Hàm dịch chính, trả về cả Text object của ML Kit để hỗ trợ tính năng Lens Mode (vẽ đè tọa độ)
+     */
+    suspend fun recognizeAndGetVisionText(bitmap: Bitmap): Pair<Text?, String> = withContext(Dispatchers.Default) {
+        if (isReleased || bitmap.isRecycled) return@withContext Pair(null, "")
         if (bitmap.width < MIN_BITMAP_DIMENSION || bitmap.height < MIN_BITMAP_DIMENSION) {
-            return@withContext ""
+            return@withContext Pair(null, "")
         }
 
         val ocrBitmap = if (bitmap.height < UPSCALE_HEIGHT_THRESHOLD) {
@@ -78,11 +86,21 @@ class TranslationManager(
         }
 
         try {
-            val inputImage = InputImage.fromBitmap(ocrBitmap, 0)
-            val visionText = recognizer.process(inputImage).await()
+            var inputImage = InputImage.fromBitmap(ocrBitmap, 0)
+            var visionText = recognizer.process(inputImage).await()
+
+            // TÍNH NĂNG 2: Nếu lần 1 không tìm thấy chữ do nền game rối, tự động kích hoạt bộ lọc tăng tương phản
+            if (visionText.textBlocks.isEmpty()) {
+                val enhancedBitmap = applyContrastEnhancement(ocrBitmap)
+                inputImage = InputImage.fromBitmap(enhancedBitmap, 0)
+                visionText = recognizer.process(inputImage).await()
+                if (enhancedBitmap !== ocrBitmap && !enhancedBitmap.isRecycled) {
+                    enhancedBitmap.recycle()
+                }
+            }
 
             if (visionText.textBlocks.isEmpty()) {
-                return@withContext EMPTY_TEXT_MESSAGE
+                return@withContext Pair(null, EMPTY_TEXT_MESSAGE)
             }
 
             val glossaryHash = glossaryManager.getConfigHash()
@@ -115,15 +133,15 @@ class TranslationManager(
             }
 
             if (translatedParagraphs.isEmpty()) {
-                return@withContext EMPTY_TEXT_MESSAGE
+                return@withContext Pair(visionText, EMPTY_TEXT_MESSAGE)
             }
 
-            return@withContext translatedParagraphs.joinToString(separator = "\n\n")
+            return@withContext Pair(visionText, translatedParagraphs.joinToString(separator = "\n\n"))
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             Log.e(TAG, "Lỗi OCR hoặc Dịch", e)
-            return@withContext "Đã xảy ra lỗi khi dịch: ${e.localizedMessage}"
+            return@withContext Pair(null, "Đã xảy ra lỗi khi dịch: ${e.localizedMessage}")
         } finally {
             if (ocrBitmap !== bitmap && !ocrBitmap.isRecycled) {
                 ocrBitmap.recycle()
@@ -131,10 +149,43 @@ class TranslationManager(
         }
     }
 
+    suspend fun recognizeAndTranslate(bitmap: Bitmap): String {
+        return recognizeAndGetVisionText(bitmap).second
+    }
+
+    /**
+     * Thuật toán tăng tương phản (Binarization & Contrast Filter) để OCR đọc chữ chìm/nền rối
+     */
+    private fun applyContrastEnhancement(src: Bitmap): Bitmap {
+        val width = src.width
+        val height = src.height
+        val dest = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(dest)
+        val paint = Paint()
+
+        val colorMatrix = ColorMatrix().apply {
+            setSaturation(0.0f) // Chuyển sang thang độ xám (Grayscale)
+        }
+        // Đẩy độ tương phản lên 1.8 lần
+        val scale = 1.8f
+        val translate = -0.5f * 255.0f * (scale - 1.0f)
+        colorMatrix.set(
+            floatArrayOf(
+                scale, 0f, 0f, 0f, translate,
+                0f, scale, 0f, 0f, translate,
+                0f, 0f, scale, 0f, translate,
+                0f, 0f, 0f, 1f, 0f
+            )
+        )
+
+        paint.colorFilter = ColorMatrixColorFilter(colorMatrix)
+        canvas.drawBitmap(src, 0f, 0f, paint)
+        return dest
+    }
+
     suspend fun translateBlock(text: String): String = withContext(Dispatchers.IO) {
         if (text.isBlank()) return@withContext ""
 
-        // LỚP 1: Cổng GTX (0đ, Không API Key, Timeout 1500ms)
         try {
             val encodedText = URLEncoder.encode(text, "UTF-8")
             val urlString =
@@ -172,13 +223,10 @@ class TranslationManager(
                 connection.disconnect()
             }
         } catch (e: CancellationException) {
-            // BẮT BUỘC ném lại CancellationException để dừng ngay khi người dùng đóng bảng dịch
             throw e
-        } catch (e: Exception) {
-            Log.w(TAG, "Cổng GTX quá hạn hoặc mất mạng, tự động chuyển sang ML Kit Offline.")
+        } catch (_: Exception) {
         }
 
-        // LỚP 2: Auto-Fallback tức thì về ML Kit Offline
         return@withContext try {
             mlKitTranslator.translate(text).await()
         } catch (e: CancellationException) {
@@ -196,6 +244,7 @@ class TranslationManager(
     fun release() {
         if (isReleased) return
         isReleased = true
+        ttsManager.release()
         try {
             recognizer.close()
         } catch (_: Exception) {
