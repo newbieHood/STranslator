@@ -14,6 +14,7 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import android.view.WindowManager
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -27,7 +28,7 @@ class ScreenCaptureManager(
         private const val VIRTUAL_DISPLAY_NAME = "OneUI8_ScreenCapture"
         private const val MAX_IMAGES = 2
         private const val MAX_RETRIES = 3
-        private const val RETRY_DELAY_MS = 40L
+        private const val RETRY_DELAY_MS = 45L
     }
 
     private val mediaProjectionManager =
@@ -58,12 +59,11 @@ class ScreenCaptureManager(
     }
 
     fun initialize(resultCode: Int, resultData: Intent) {
+        // Nếu khởi tạo lại từ đầu, dọn dẹp phiên cũ trước để tránh rò rỉ
         if (isReady) {
-            Log.w(TAG, "ScreenCaptureManager đã được khởi tạo, bỏ qua.")
-            return
+            releaseAll()
         }
 
-        // Lấy độ phân giải vật lý toàn màn hình (gồm cả camera khuyết & thanh điều hướng 3 nút)
         val maxBounds = windowManager.maximumWindowMetrics.bounds
         screenWidth = maxBounds.width()
         screenHeight = maxBounds.height()
@@ -97,14 +97,59 @@ class ScreenCaptureManager(
         )
     }
 
-    suspend fun captureScreen(): Bitmap? = withContext(Dispatchers.Default) {
-        val reader = imageReader
-        if (reader == null || !isReady) return@withContext null
+    /**
+     * Tự động kiểm tra và cập nhật độ phân giải nếu người dùng xoay màn hình (Dọc <-> Ngang khi vào Game)
+     * Sử dụng virtualDisplay.resize() hợp chuẩn Android 14-16 mà không cần tạo VirtualDisplay mới.
+     */
+    private suspend fun syncDisplaySizeIfRotated(): Boolean = withContext(Dispatchers.Main) {
+        val vDisplay = virtualDisplay ?: return@withContext false
+        val maxBounds = windowManager.maximumWindowMetrics.bounds
+        val newWidth = maxBounds.width()
+        val newHeight = maxBounds.height()
+        val newDensity = context.resources.configuration.densityDpi
 
+        if (newWidth == screenWidth && newHeight == screenHeight && imageReader != null) {
+            return@withContext false
+        }
+
+        Log.d(TAG, "Phát hiện xoay màn hình: ${screenWidth}x${screenHeight} -> ${newWidth}x${newHeight}")
+        screenWidth = newWidth
+        screenHeight = newHeight
+        screenDensity = newDensity
+
+        val oldReader = imageReader
+        val newReader = ImageReader.newInstance(
+            screenWidth,
+            screenHeight,
+            PixelFormat.RGBA_8888,
+            MAX_IMAGES
+        )
+        imageReader = newReader
+
+        // Cập nhật kích thước và Surface mới cho VirtualDisplay hiện tại
+        vDisplay.resize(screenWidth, screenHeight, screenDensity)
+        vDisplay.surface = newReader.surface
+
+        try {
+            oldReader?.close()
+        } catch (_: Exception) {
+        }
+        return@withContext true
+    }
+
+    suspend fun captureScreen(): Bitmap? = withContext(Dispatchers.Default) {
+        if (!isReady) return@withContext null
+
+        // Kiểm tra nếu vừa xoay màn hình sang ngang/dọc thì chờ thêm 60ms để Surface mới nhận frame
+        val wasRotated = syncDisplaySizeIfRotated()
+        if (wasRotated) {
+            delay(60L)
+        }
+
+        val reader = imageReader ?: return@withContext null
         var image: Image? = null
         var attempt = 0
 
-        // Thử lại tối đa 3 lần (mỗi lần cách nhau 40ms) nếu màn hình tĩnh trả về null
         while (attempt <= MAX_RETRIES) {
             image = try {
                 reader.acquireLatestImage()
@@ -143,6 +188,8 @@ class ScreenCaptureManager(
             }
 
             return@withContext finalBitmap
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             Log.e(TAG, "Lỗi chuyển đổi buffer sang Bitmap", e)
             return@withContext null
