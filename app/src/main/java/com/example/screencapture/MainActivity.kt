@@ -104,7 +104,6 @@ fun TranslatorMainScreen(
         mutableStateOf(checkNotificationPermission(context))
     }
 
-    // Tự động làm mới trạng thái quyền khi người dùng quay lại từ Cài đặt hệ thống
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
@@ -116,7 +115,6 @@ fun TranslatorMainScreen(
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    // Tự động kiểm tra và tải gói từ điển ML Kit Offline (~30MB) ngay khi mở app
     LaunchedEffect(Unit) {
         isDownloadingModel = true
         isModelReady = translationManager.prepareLanguageModel()
@@ -135,5 +133,284 @@ fun TranslatorMainScreen(
         if (result.resultCode == Activity.RESULT_OK && result.data != null) {
             val serviceIntent = Intent(context, FloatingWindowService::class.java).apply {
                 action = FloatingWindowService.ACTION_START_PROJECTION
-                putExtra(FloatingWindowService.EXTRA_RESULT_CODE
+                putExtra(FloatingWindowService.EXTRA_RESULT_CODE, result.resultCode)
+                putExtra(FloatingWindowService.EXTRA_RESULT_DATA, result.data)
+            }
+            ContextCompat.startForegroundService(context, serviceIntent)
+        }
+    }
 
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .padding(24.dp),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text(
+            text = "Android Screen Translator",
+            fontSize = 22.sp,
+            fontWeight = FontWeight.Bold
+        )
+        Text(
+            text = "Hybrid GTX Online + ML Kit Offline",
+            fontSize = 13.sp,
+            color = Color.Gray
+        )
+
+        Spacer(modifier = Modifier.height(24.dp))
+
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(
+                containerColor = if (isModelReady) Color(0xFFE6F4EA) else Color(0xFFF1F3F4)
+            )
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp)
+            ) {
+                when {
+                    isDownloadingModel -> {
+                        Text(
+                            text = "Đang tải gói ngôn ngữ Offline (~30MB)...",
+                            fontWeight = FontWeight.Medium,
+                            color = Color.DarkGray
+                        )
+                        Spacer(modifier = Modifier.height(10.dp))
+                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                    }
+                    isModelReady -> {
+                        Text(
+                            text = "Sẵn sàng dịch Offline",
+                            fontWeight = FontWeight.Bold,
+                            color = Color(0xFF137333)
+                        )
+                    }
+                    else -> {
+                        Text(
+                            text = "Chưa tải được gói ngôn ngữ Offline (~30MB). Hãy bật mạng lần đầu.",
+                            color = Color(0xFFC5221F),
+                            fontWeight = FontWeight.Medium
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        OutlinedButton(
+                            onClick = {
+                                coroutineScope.launch {
+                                    isDownloadingModel = true
+                                    isModelReady = translationManager.prepareLanguageModel()
+                                    isDownloadingModel = false
+                                }
+                            }
+                        ) {
+                            Text("Thử tải lại")
+                        }
+                    }
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        OutlinedButton(
+            onClick = { showGlossaryDialog = true },
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(48.dp)
+        ) {
+            Text(
+                text = "Quản lý Từ điển & Giữ từ tiếng Anh",
+                fontWeight = FontWeight.SemiBold
+            )
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        if (!hasOverlayPermission) {
+            OutlinedButton(
+                onClick = {
+                    val intent = Intent(
+                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                        Uri.parse("package:${context.packageName}")
+                    )
+                    context.startActivity(intent)
+                },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("1. Cấp quyền Hiển thị trên ứng dụng khác (Overlay)")
+            }
+            Spacer(modifier = Modifier.height(12.dp))
+        }
+
+        if (!hasNotificationPermission) {
+            OutlinedButton(
+                onClick = {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                    }
+                },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("2. Cấp quyền Thông báo (Foreground Service)")
+            }
+            Spacer(modifier = Modifier.height(12.dp))
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        val canStartService = isModelReady && hasOverlayPermission && hasNotificationPermission
+
+        Button(
+            onClick = {
+                val projectionManager =
+                    context.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                mediaProjectionLauncher.launch(projectionManager.createScreenCaptureIntent())
+            },
+            enabled = canStartService,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(52.dp)
+        ) {
+            Text(
+                text = "Khởi động Nút Dịch Nổi",
+                fontSize = 16.sp,
+                fontWeight = FontWeight.Bold
+            )
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        // Nút dừng nhanh Dịch vụ Nút Nổi
+        OutlinedButton(
+            onClick = {
+                context.stopService(Intent(context, FloatingWindowService::class.java))
+                Toast.makeText(context, "Đã tắt Nút Dịch Nổi", Toast.LENGTH_SHORT).show()
+            },
+            colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFFC5221F)),
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(46.dp)
+        ) {
+            Text(
+                text = "Tắt Nút Dịch Nổi",
+                fontWeight = FontWeight.SemiBold
+            )
+        }
+    }
+
+    if (showGlossaryDialog) {
+        GlossaryManagementDialog(
+            glossaryManager = translationManager.glossaryManager,
+            onSaved = {
+                translationManager.clearCache()
+                showGlossaryDialog = false
+                Toast.makeText(context, "Đã lưu từ điển & làm mới bộ nhớ đệm", Toast.LENGTH_SHORT).show()
+            },
+            onDismiss = { showGlossaryDialog = false }
+        )
+    }
+}
+
+@Composable
+fun GlossaryManagementDialog(
+    glossaryManager: GlossaryManager,
+    onSaved: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    var rawText by remember { mutableStateOf(glossaryManager.getRawGlossary()) }
+    var keepAllCaps by remember { mutableStateOf(glossaryManager.isKeepAllCaps()) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Text(
+                text = "Từ điển & Giữ từ tiếng Anh",
+                fontSize = 18.sp,
+                fontWeight = FontWeight.Bold
+            )
+        },
+        text = {
+            Column(modifier = Modifier.fillMaxWidth()) {
+                Text(
+                    text = "• Ghi 1 từ mỗi dòng (VD: Mana, Stun) để giữ nguyên tiếng Anh.\n• Ghi có dấu '=' (VD: Deck = Bộ bài) để ép dịch nghĩa cố định.",
+                    fontSize = 13.sp,
+                    color = Color.DarkGray,
+                    lineHeight = 18.sp
+                )
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                OutlinedTextField(
+                    value = rawText,
+                    onValueChange = { rawText = it },
+                    label = { Text("Danh sách thuật ngữ (mỗi dòng 1 mục)") },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(200.dp),
+                    maxLines = 15
+                )
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Giữ từ IN HOA (keepAllCaps)",
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = 14.sp
+                        )
+                        Text(
+                            text = "Tự giữ nguyên từ viết hoa từ 2 ký tự trở lên (trừ ATK, DMG, HP... vẫn bung nghĩa)",
+                            fontSize = 12.sp,
+                            color = Color.Gray
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Switch(
+                        checked = keepAllCaps,
+                        onCheckedChange = { keepAllCaps = it }
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    glossaryManager.saveRawGlossary(rawText)
+                    glossaryManager.setKeepAllCaps(keepAllCaps)
+                    onSaved()
+                }
+            ) {
+                Text("Lưu cài đặt")
+            }
+        },
+        dismissButton = {
+            Row {
+                TextButton(
+                    onClick = { rawText = GlossaryManager.DEFAULT_GLOSSARY }
+                ) {
+                    Text("Mặc định")
+                }
+                TextButton(onClick = onDismiss) {
+                    Text("Hủy")
+                }
+            }
+        }
+    )
+}
+
+private fun checkNotificationPermission(context: Context): Boolean {
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.POST_NOTIFICATIONS
+        ) == PackageManager.PERMISSION_GRANTED
+    } else {
+        true
+    }
+}
