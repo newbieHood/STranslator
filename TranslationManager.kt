@@ -13,6 +13,7 @@ import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.TextRecognizer
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
@@ -55,6 +56,8 @@ class TranslationManager(
             val conditions = DownloadConditions.Builder().build()
             mlKitTranslator.downloadModelIfNeeded(conditions).await()
             true
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             Log.e(TAG, "Lỗi tải gói ngôn ngữ Offline", e)
             false
@@ -62,13 +65,12 @@ class TranslationManager(
     }
 
     suspend fun recognizeAndTranslate(bitmap: Bitmap): String = withContext(Dispatchers.Default) {
-        if (isReleased) return@withContext ""
+        if (isReleased || bitmap.isRecycled) return@withContext ""
 
         if (bitmap.width < MIN_BITMAP_DIMENSION || bitmap.height < MIN_BITMAP_DIMENSION) {
             return@withContext ""
         }
 
-        // Upscale 2x nếu chiều cao vùng cắt nhỏ hơn 180px để OCR đọc chữ nhỏ rõ nét hơn
         val ocrBitmap = if (bitmap.height < UPSCALE_HEIGHT_THRESHOLD) {
             Bitmap.createScaledBitmap(bitmap, bitmap.width * 2, bitmap.height * 2, true)
         } else {
@@ -117,6 +119,8 @@ class TranslationManager(
             }
 
             return@withContext translatedParagraphs.joinToString(separator = "\n\n")
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             Log.e(TAG, "Lỗi OCR hoặc Dịch", e)
             return@withContext "Đã xảy ra lỗi khi dịch: ${e.localizedMessage}"
@@ -167,6 +171,9 @@ class TranslationManager(
             } finally {
                 connection.disconnect()
             }
+        } catch (e: CancellationException) {
+            // BẮT BUỘC ném lại CancellationException để dừng ngay khi người dùng đóng bảng dịch
+            throw e
         } catch (e: Exception) {
             Log.w(TAG, "Cổng GTX quá hạn hoặc mất mạng, tự động chuyển sang ML Kit Offline.")
         }
@@ -174,6 +181,8 @@ class TranslationManager(
         // LỚP 2: Auto-Fallback tức thì về ML Kit Offline
         return@withContext try {
             mlKitTranslator.translate(text).await()
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             Log.e(TAG, "ML Kit Offline fallback lỗi", e)
             text
