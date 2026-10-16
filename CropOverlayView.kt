@@ -34,6 +34,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -70,11 +71,16 @@ import kotlin.math.roundToInt
 fun CropOverlayScreen(
     screenshotBitmap: Bitmap,
     translationManager: TranslationManager,
+    initialCropRect: Rect? = null,
+    onSaveCropRect: (Rect) -> Unit = {},
     onDismiss: () -> Unit
 ) {
     val context = LocalContext.current
     val density = LocalDensity.current
     val coroutineScope = rememberCoroutineScope()
+
+    val screenWidthPx = screenshotBitmap.width
+    val screenHeightPx = screenshotBitmap.height
 
     var dragStart by remember { mutableStateOf<Offset?>(null) }
     var dragEnd by remember { mutableStateOf<Offset?>(null) }
@@ -84,9 +90,6 @@ fun CropOverlayScreen(
     // Lưu độ lệch Pixel khi người dùng dùng ngón tay kéo di chuyển Card kết quả
     var cardDragOffset by remember { mutableStateOf(Offset.Zero) }
     var cardSizePx by remember { mutableStateOf(IntSize.Zero) }
-
-    val screenWidthPx = screenshotBitmap.width
-    val screenHeightPx = screenshotBitmap.height
 
     val cropRect: Rect? = remember(dragStart, dragEnd) {
         val start = dragStart
@@ -99,6 +102,60 @@ fun CropOverlayScreen(
                 bottom = max(start.y, end.y).coerceIn(0f, screenHeightPx.toFloat())
             )
         } else null
+    }
+
+    // Hàm dùng chung để cắt ảnh và dịch cho cả chế độ kéo tay lẫn chế độ Nhấp đúp tự động
+    fun executeCropAndTranslate(targetRect: Rect, saveAsLastRect: Boolean) {
+        if (targetRect.width < 40f || targetRect.height < 40f) {
+            dragStart = null
+            dragEnd = null
+            onDismiss()
+            return
+        }
+
+        if (saveAsLastRect) {
+            onSaveCropRect(targetRect)
+        }
+
+        isLoading = true
+        coroutineScope.launch {
+            val croppedBitmap = cropBitmapSafely(screenshotBitmap, targetRect)
+            if (croppedBitmap != null) {
+                val result = try {
+                    translationManager.recognizeAndTranslate(croppedBitmap)
+                } finally {
+                    if (croppedBitmap !== screenshotBitmap && !croppedBitmap.isRecycled) {
+                        croppedBitmap.recycle()
+                    }
+                }
+                isLoading = false
+                if (result.isBlank()) {
+                    onDismiss()
+                } else {
+                    translatedText = result
+                }
+            } else {
+                isLoading = false
+                onDismiss()
+            }
+        }
+    }
+
+    // Nếu được mở bằng thao tác Nhấp đúp (có sẵn initialCropRect), tự động khoanh và dịch ngay lập tức
+    LaunchedEffect(initialCropRect) {
+        if (initialCropRect != null) {
+            val clampedRect = Rect(
+                left = initialCropRect.left.coerceIn(0f, screenWidthPx.toFloat()),
+                top = initialCropRect.top.coerceIn(0f, screenHeightPx.toFloat()),
+                right = initialCropRect.right.coerceIn(0f, screenWidthPx.toFloat()),
+                bottom = initialCropRect.bottom.coerceIn(0f, screenHeightPx.toFloat())
+            )
+            if (clampedRect.width >= 40f && clampedRect.height >= 40f) {
+                dragStart = Offset(clampedRect.left, clampedRect.top)
+                dragEnd = Offset(clampedRect.right, clampedRect.bottom)
+                executeCropAndTranslate(clampedRect, saveAsLastRect = false)
+            }
+        }
     }
 
     Box(
@@ -118,8 +175,6 @@ fun CropOverlayScreen(
                 if (!isLoading) {
                     detectDragGestures(
                         onDragStart = { offset ->
-                            // Nếu đang hiện kết quả cũ mà người dùng kéo vùng mới trên nền,
-                            // tự động ẩn kết quả cũ và reset vị trí Card để khoanh vùng mới
                             translatedText = null
                             cardDragOffset = Offset.Zero
                             dragStart = offset
@@ -131,36 +186,10 @@ fun CropOverlayScreen(
                         },
                         onDragEnd = {
                             val rect = cropRect
-                            // Nếu vùng kéo < 40px (chạm nhầm) thì đóng lớp phủ
-                            if (rect == null || rect.width < 40f || rect.height < 40f) {
-                                dragStart = null
-                                dragEnd = null
+                            if (rect != null) {
+                                executeCropAndTranslate(rect, saveAsLastRect = true)
+                            } else {
                                 onDismiss()
-                                return@detectDragGestures
-                            }
-
-                            isLoading = true
-                            coroutineScope.launch {
-                                val croppedBitmap = cropBitmapSafely(screenshotBitmap, rect)
-                                if (croppedBitmap != null) {
-                                    val result = try {
-                                        translationManager.recognizeAndTranslate(croppedBitmap)
-                                    } finally {
-                                        // Chỉ giải phóng mảnh Bitmap cắt nhỏ, giữ nguyên screenshotBitmap để có thể "Khoanh lại"
-                                        if (croppedBitmap !== screenshotBitmap && !croppedBitmap.isRecycled) {
-                                            croppedBitmap.recycle()
-                                        }
-                                    }
-                                    isLoading = false
-                                    if (result.isBlank()) {
-                                        onDismiss()
-                                    } else {
-                                        translatedText = result
-                                    }
-                                } else {
-                                    isLoading = false
-                                    onDismiss()
-                                }
                             }
                         }
                     )
@@ -200,7 +229,7 @@ fun CropOverlayScreen(
             }
         }
 
-        // Nhãn hướng dẫn nhỏ ở mép trên khi người dùng chưa khoanh hoặc vừa bấm "Khoanh lại"
+        // Nhãn hướng dẫn ở mép trên khi đang đợi người dùng kéo chọn vùng
         if (!isLoading && translatedText == null && cropRect == null) {
             Box(
                 modifier = Modifier
@@ -211,9 +240,9 @@ fun CropOverlayScreen(
                     .padding(horizontal = 16.dp, vertical = 8.dp)
             ) {
                 Text(
-                    text = "Kéo ngón tay để khoanh vùng chữ • Chạm nhẹ để thoát",
+                    text = "Kéo để khoanh vùng • Lần sau nhấp đúp nút A/V để dịch lại vùng này",
                     color = Color.White,
-                    fontSize = 13.sp,
+                    fontSize = 12.5.sp,
                     fontWeight = FontWeight.Medium
                 )
             }
@@ -239,12 +268,11 @@ fun CropOverlayScreen(
         val currentResult = translatedText
         if (!isLoading && currentResult != null && cropRect != null) {
             val horizontalMarginPx = 32
-            val bottomNavSafePx = 150 // Khoảng cách an toàn không đè lên thanh điều hướng 3 nút
+            val bottomNavSafePx = 150 // Khoảng cách an toàn né thanh điều hướng 3 nút
             val maxCardHeightPx = with(density) { 250.dp.roundToPx() }
             val estimatedCardHeightPx = if (cardSizePx.height > 0) cardSizePx.height else maxCardHeightPx
             val cardWidthPx = if (cardSizePx.width > 0) cardSizePx.width else (screenWidthPx - horizontalMarginPx * 2)
 
-            // Vị trí gốc ban đầu (tự đẩy lên trên nếu cách đáy màn hình < 700px)
             val spaceBelowPx = screenHeightPx - cropRect.bottom
             val baseYPx = if (spaceBelowPx >= 700f) {
                 (cropRect.bottom + 16f).roundToInt()
@@ -262,7 +290,6 @@ fun CropOverlayScreen(
                 max(horizontalMarginPx, screenWidthPx - cardWidthPx - horizontalMarginPx)
             )
 
-            // Cộng thêm độ lệch khi người dùng kéo Card và giới hạn trong vùng màn hình an toàn
             val maxAllowedXPx = max(16, screenWidthPx - cardWidthPx - 16)
             val maxAllowedYPx = max(48, screenHeightPx - estimatedCardHeightPx - bottomNavSafePx)
 
@@ -284,7 +311,7 @@ fun CropOverlayScreen(
                         interactionSource = remember { MutableInteractionSource() },
                         indication = null
                     ) { /* Chặn chạm xuyên qua Card */ }
-                    // Cho phép giữ và kéo di chuyển Card đi bất kỳ đâu trên màn hình
+                    // Kéo di chuyển Card tự do trên màn hình
                     .pointerInput(Unit) {
                         detectDragGestures { change, dragAmount ->
                             change.consume()
@@ -294,7 +321,7 @@ fun CropOverlayScreen(
             ) {
                 Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
 
-                    // Thanh nắm kéo (Drag Handle) ở đầu Card để người dùng dễ nhận biết và kéo
+                    // Thanh nắm kéo (Drag Handle) ở đầu Card
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -334,7 +361,6 @@ fun CropOverlayScreen(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        // Nút "Khoanh lại" nằm bên trái để chọn vùng chữ khác trên cùng bức ảnh
                         TextButton(
                             onClick = {
                                 translatedText = null
@@ -345,13 +371,12 @@ fun CropOverlayScreen(
                         ) {
                             Text(
                                 text = "Khoanh lại",
-                                color = Color(0xFFFDD663), // Vàng sáng nổi bật
+                                color = Color(0xFFFDD663),
                                 fontSize = 13.sp,
                                 fontWeight = FontWeight.SemiBold
                             )
                         }
 
-                        // Cụm nút "Copy" và "Đóng" nằm bên phải
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             TextButton(
                                 onClick = {
