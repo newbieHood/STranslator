@@ -11,6 +11,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.ServiceInfo
+import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
@@ -20,11 +21,14 @@ import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
@@ -65,7 +69,6 @@ class FloatingWindowService : Service() {
         const val EXTRA_RESULT_CODE = "EXTRA_RESULT_CODE"
         const val EXTRA_RESULT_DATA = "EXTRA_RESULT_DATA"
 
-        // Lưu trữ tọa độ khung khoanh gần nhất (Last Crop Rect)
         private const val CROP_PREFS_NAME = "screen_translator_crop_prefs"
         private const val KEY_HAS_LAST_RECT = "has_last_rect"
         private const val KEY_RECT_LEFT = "rect_left"
@@ -73,17 +76,18 @@ class FloatingWindowService : Service() {
         private const val KEY_RECT_RIGHT = "rect_right"
         private const val KEY_RECT_BOTTOM = "rect_bottom"
 
-        // Cấu hình UI/UX cho Nút Nổi
         private const val BUTTON_SIZE_DP = 52f
         private const val EDGE_MARGIN_DP = 8f
         private const val TOP_SAFE_MARGIN_DP = 48f
         private const val BOTTOM_NAV_SAFE_MARGIN_DP = 84f
         private const val IDLE_TIMEOUT_MS = 3000L
         private const val IDLE_ALPHA = 0.35f
-        private const val DOUBLE_TAP_TIMEOUT_MS = 240L // Khoảng thời gian nhận diện nhấp đúp
+        private const val DOUBLE_TAP_TIMEOUT_MS = 240L
+        private const val LONG_PRESS_TIMEOUT_MS = 800L
     }
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     private lateinit var windowManager: WindowManager
     private lateinit var screenCaptureManager: ScreenCaptureManager
@@ -93,14 +97,16 @@ class FloatingWindowService : Service() {
     private var floatingView: View? = null
     private var iconCanvasView: View? = null
     private lateinit var floatingParams: WindowManager.LayoutParams
-    private var cropOverlayView: ComposeView? = null
+    private var cropOverlayView: View? = null
     private var activeComposeOwner: OverlayComposeLifecycleOwner? = null
 
-    // Biến lưu tọa độ khung khoanh gần nhất để dịch nhanh khi Nhấp đúp
     private var lastCropRect: Rect? = null
+    private var isAutoWatchActive = false // Trạng thái tính năng Auto-Watch (Tính năng 4)
 
     private var idleDimJob: Job? = null
     private var singleTapJob: Job? = null
+    private var longPressJob: Job? = null
+    private var autoWatchJob: Job? = null
     private var snapAnimator: ValueAnimator? = null
     private var isCapturing = false
 
@@ -109,7 +115,6 @@ class FloatingWindowService : Service() {
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         cropPrefs = getSharedPreferences(CROP_PREFS_NAME, Context.MODE_PRIVATE)
 
-        // Khôi phục tọa độ khung khoanh gần nhất từ lần sử dụng trước (nếu có)
         lastCropRect = loadLastCropRectFromPrefs()
 
         screenCaptureManager = ScreenCaptureManager(
@@ -121,6 +126,34 @@ class FloatingWindowService : Service() {
 
         translationManager = TranslationManager(this)
         createNotificationChannel()
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        if (cropOverlayView != null) {
+            removeCropOverlay()
+            restoreFloatingButton()
+        }
+        floatingView?.let { v ->
+            if (v.isAttachedToWindow) {
+                val bounds = windowManager.maximumWindowMetrics.bounds
+                val screenWidth = bounds.width()
+                val screenHeight = bounds.height()
+                val buttonSizePx = dpToPx(BUTTON_SIZE_DP)
+                val edgeMarginPx = dpToPx(EDGE_MARGIN_DP)
+                val minY = dpToPx(TOP_SAFE_MARGIN_DP)
+                val maxY = (screenHeight - buttonSizePx - dpToPx(BOTTOM_NAV_SAFE_MARGIN_DP))
+                    .coerceAtLeast(minY)
+
+                floatingParams.x = if (floatingParams.x < screenWidth / 2) {
+                    edgeMarginPx
+                } else {
+                    screenWidth - buttonSizePx - edgeMarginPx
+                }
+                floatingParams.y = floatingParams.y.coerceIn(minY, maxY)
+                windowManager.updateViewLayout(v, floatingParams)
+            }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -139,9 +172,14 @@ class FloatingWindowService : Service() {
                 }
 
                 if (resultCode == Activity.RESULT_OK && resultData != null) {
-                    startMediaProjectionForeground()
-                    screenCaptureManager.initialize(resultCode, resultData)
-                    showFloatingButtonIfNeeded()
+                    try {
+                        startMediaProjectionForeground()
+                        screenCaptureManager.initialize(resultCode, resultData)
+                        showFloatingButtonIfNeeded()
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Khởi tạo MediaProjection thất bại", e)
+                        stopSelf()
+                    }
                 } else {
                     Log.e(TAG, "Dữ liệu MediaProjection không hợp lệ. Dừng Service.")
                     stopSelf()
@@ -218,7 +256,6 @@ class FloatingWindowService : Service() {
                 textAlign = Paint.Align.CENTER
             }
 
-            // Chấm vàng nhỏ báo hiệu đã có vùng nhớ (sẵn sàng Nhấp đúp)
             private val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 color = Color.parseColor("#FDD663")
                 style = Paint.Style.FILL
@@ -231,7 +268,13 @@ class FloatingWindowService : Service() {
                 val pad = w * 0.24f
                 val cornerLen = w * 0.13f
 
-                // 4 góc khung ngắm
+                // Đổi màu viền sang xanh lá nếu Auto-Watch đang hoạt động
+                if (isAutoWatchActive) {
+                    cornerPaint.color = Color.parseColor("#81C995")
+                } else {
+                    cornerPaint.color = Color.parseColor("#8AB4F8")
+                }
+
                 canvas.drawLine(pad, pad, pad + cornerLen, pad, cornerPaint)
                 canvas.drawLine(pad, pad, pad, pad + cornerLen, cornerPaint)
                 canvas.drawLine(w - pad, pad, w - pad - cornerLen, pad, cornerPaint)
@@ -241,12 +284,10 @@ class FloatingWindowService : Service() {
                 canvas.drawLine(w - pad, h - pad, w - pad - cornerLen, h - pad, cornerPaint)
                 canvas.drawLine(w - pad, h - pad, w - pad, h - pad - cornerLen, cornerPaint)
 
-                // Chữ "A/V" ở tâm
                 val textY = h / 2f - (textPaint.descent() + textPaint.ascent()) / 2f
-                canvas.drawText("A/V", w / 2f, textY, textPaint)
+                canvas.drawText(if (isAutoWatchActive) "ON" else "A/V", w / 2f, textY, textPaint)
 
-                // Nếu đã lưu tọa độ khung khoanh gần nhất, vẽ 1 chấm tròn vàng nhỏ dưới chữ A/V
-                if (lastCropRect != null) {
+                if (lastCropRect != null && !isAutoWatchActive) {
                     canvas.drawCircle(w / 2f, h * 0.74f, dpToPx(2.2f).toFloat(), dotPaint)
                 }
             }
@@ -257,9 +298,6 @@ class FloatingWindowService : Service() {
         return container
     }
 
-    /**
-     * Phân biệt kéo thả, Chạm đơn (Khoanh vùng mới) và Nhấp đúp (Dịch lại vùng cũ)
-     */
     private fun setupDragSnapAndClick(view: View) {
         var initialX = 0
         var initialY = 0
@@ -277,15 +315,22 @@ class FloatingWindowService : Service() {
                     initialY = floatingParams.y
                     initialTouchX = event.rawX
                     initialTouchY = event.rawY
+
+                    // TÍNH NĂNG 4: Hẹn giờ Nhấn giữ (Long-Press 0.8s) để bật/tắt Auto-Watch
+                    longPressJob?.cancel()
+                    longPressJob = serviceScope.launch {
+                        delay(LONG_PRESS_TIMEOUT_MS)
+                        toggleAutoWatchMode()
+                    }
                     true
                 }
 
                 MotionEvent.ACTION_MOVE -> {
                     val deltaX = abs(event.rawX - initialTouchX)
                     val deltaY = abs(event.rawY - initialTouchY)
-                    // Nếu người dùng bắt đầu kéo nút đi, hủy lệnh chờ chạm đơn (nếu có)
                     if (deltaX >= 15 || deltaY >= 15) {
                         singleTapJob?.cancel()
+                        longPressJob?.cancel() // Hủy nhấn giữ nếu người dùng kéo nút đi
                     }
 
                     val bounds = windowManager.maximumWindowMetrics.bounds
@@ -310,6 +355,7 @@ class FloatingWindowService : Service() {
                 }
 
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    longPressJob?.cancel() // Hủy lệnh nhấn giữ khi nhấc tay lên
                     v.animate().scaleX(1f).scaleY(1f).setDuration(120).start()
 
                     val deltaX = abs(event.rawX - initialTouchX)
@@ -320,7 +366,6 @@ class FloatingWindowService : Service() {
                         val now = SystemClock.uptimeMillis()
 
                         if (now - lastTapUpTime <= DOUBLE_TAP_TIMEOUT_MS) {
-                            // PHÁT HIỆN NHẤP ĐÚP (Double-Tap): Hủy chạm đơn, dịch ngay vùng nhớ cũ
                             singleTapJob?.cancel()
                             lastTapUpTime = 0L
 
@@ -335,7 +380,6 @@ class FloatingWindowService : Service() {
                                 triggerScreenCapture(useSavedRect = false)
                             }
                         } else {
-                            // CHẠM LẦN 1: Chờ 240ms xem người dùng có chạm tiếp lần 2 không
                             lastTapUpTime = now
                             singleTapJob?.cancel()
                             singleTapJob = serviceScope.launch {
@@ -353,6 +397,99 @@ class FloatingWindowService : Service() {
 
                 else -> false
             }
+        }
+    }
+
+    /**
+     * Bật/Tắt chế độ Auto-Watch (Canh chừng phụ đề tự động)
+     */
+    private fun toggleAutoWatchMode() {
+        isAutoWatchActive = !isAutoWatchActive
+        iconCanvasView?.invalidate()
+
+        if (isAutoWatchActive) {
+            if (lastCropRect == null) {
+                Toast.makeText(this, "Hãy kéo khoanh vùng hội thoại ít nhất 1 lần trước khi bật Auto-Watch!", Toast.LENGTH_LONG).show()
+                isAutoWatchActive = false
+                iconCanvasView?.invalidate()
+                return
+            }
+            Toast.makeText(this, "Đã BẬT Auto-Watch: Đang theo dõi phụ đề game...", Toast.LENGTH_SHORT).show()
+            startAutoWatchLoop()
+        } else {
+            Toast.makeText(this, "Đã TẮT Auto-Watch", Toast.LENGTH_SHORT).show()
+            stopAutoWatchLoop()
+        }
+    }
+
+    /**
+     * Vòng lặp Auto-Watch: Kiểm tra mỗi 1.2s, chỉ OCR khi phát hiện thay đổi Pixel trên vùng phụ đề
+     */
+    private fun startAutoWatchLoop() {
+        autoWatchJob?.cancel()
+        autoWatchJob = serviceScope.launch {
+            var previousHash = 0L
+            while (isAutoWatchActive) {
+                delay(1200L) // Kiểm tra mỗi 1.2 giây
+                if (!isCapturing && screenCaptureManager.isReady && lastCropRect != null) {
+                    val rect = lastCropRect!!
+                    val bitmap = screenCaptureManager.captureScreen()
+                    if (bitmap != null) {
+                        try {
+                            val cropped = cropBitmapSafely(bitmap, rect)
+                            if (cropped != null) {
+                                val currentHash = computeSimplePixelHash(cropped)
+                                if (currentHash != previousHash) {
+                                    previousHash = currentHash
+                                    // Phát hiện thay đổi câu thoại -> Tự động dịch và hiện Card kết quả
+                                    onCaptureSuccess(bitmap, rect)
+                                    // Tạm dừng vòng lặp Auto-Watch trong lúc hiển thị Card cho người đọc
+                                    isAutoWatchActive = false
+                                    iconCanvasView?.invalidate()
+                                    break
+                                }
+                                if (cropped !== bitmap && !cropped.isRecycled) cropped.recycle()
+                            }
+                        } finally {
+                            if (!bitmap.isRecycled) bitmap.recycle()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun stopAutoWatchLoop() {
+        autoWatchJob?.cancel()
+        autoWatchJob = null
+    }
+
+    /**
+     * Thuật toán băm điểm ảnh (Pixel Hash) siêu nhẹ để kiểm tra xem phụ đề đã đổi chưa (Tốn chưa tới 0.1ms)
+     */
+    private fun computeSimplePixelHash(bitmap: Bitmap): Long {
+        var hash = 0L
+        val stepX = max(1, bitmap.width / 10)
+        val stepY = max(1, bitmap.height / 10)
+        for (x in 0 until bitmap.width step stepX) {
+            for (y in 0 until bitmap.height step stepY) {
+                val pixel = bitmap.getPixel(x, y)
+                hash = 31 * hash + pixel.toLong()
+            }
+        }
+        return hash
+    }
+
+    private fun cropBitmapSafely(source: Bitmap, rect: Rect): Bitmap? {
+        return try {
+            val x = rect.left.roundToInt().coerceIn(0, source.width - 1)
+            val y = rect.top.roundToInt().coerceIn(0, source.height - 1)
+            val width = rect.width.roundToInt().coerceAtMost(source.width - x)
+            val height = rect.height.roundToInt().coerceAtMost(source.height - y)
+            if (width < 32 || height < 32) return null
+            Bitmap.createBitmap(source, x, y, width, height)
+        } catch (_: Exception) {
+            null
         }
     }
 
@@ -403,7 +540,7 @@ class FloatingWindowService : Service() {
         idleDimJob = serviceScope.launch {
             delay(IDLE_TIMEOUT_MS)
             floatingView?.let { v ->
-                if (v.isAttachedToWindow && v.visibility == View.VISIBLE && !isCapturing) {
+                if (v.isAttachedToWindow && v.visibility == View.VISIBLE && !isCapturing && !isAutoWatchActive) {
                     v.animate()
                         .alpha(IDLE_ALPHA)
                         .scaleX(0.90f)
@@ -415,11 +552,6 @@ class FloatingWindowService : Service() {
         }
     }
 
-    /**
-     * Chụp màn hình với tùy chọn:
-     * - useSavedRect = false (Chạm 1 lần): Mở màn hình để người dùng tự kéo chọn vùng mới.
-     * - useSavedRect = true (Nhấp đúp): Áp dụng ngay lastCropRect để dịch tức thì.
-     */
     private fun triggerScreenCapture(useSavedRect: Boolean) {
         if (isCapturing || !screenCaptureManager.isReady) return
         isCapturing = true
@@ -461,15 +593,20 @@ class FloatingWindowService : Service() {
         removeCropOverlay()
 
         val overlayParams = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.MATCH_PARENT,
+            bitmap.width,
+            bitmap.height,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
-                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
         ).apply {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            gravity = Gravity.TOP or Gravity.START
+            x = 0
+            y = 0
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                 layoutInDisplayCutoutMode =
                     WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
             }
@@ -480,11 +617,33 @@ class FloatingWindowService : Service() {
         composeOwner.onCreate()
         activeComposeOwner = composeOwner
 
-        val composeView = ComposeView(this).apply {
+        val dismissAction = {
+            removeCropOverlay()
+            restoreFloatingButton()
+            mainHandler.postDelayed({
+                if (!bitmap.isRecycled) {
+                    bitmap.recycle()
+                }
+            }, 200L)
+        }
+
+        val rootContainer = object : FrameLayout(this) {
+            override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+                if (event.keyCode == KeyEvent.KEYCODE_BACK && event.action == KeyEvent.ACTION_UP) {
+                    dismissAction()
+                    return true
+                }
+                return super.dispatchKeyEvent(event)
+            }
+        }.apply {
+            isFocusable = true
+            isFocusableInTouchMode = true
             setViewTreeLifecycleOwner(composeOwner)
             setViewTreeViewModelStoreOwner(composeOwner)
             setViewTreeSavedStateRegistryOwner(composeOwner)
+        }
 
+        val composeView = ComposeView(this).apply {
             setContent {
                 CropOverlayScreen(
                     screenshotBitmap = bitmap,
@@ -493,19 +652,22 @@ class FloatingWindowService : Service() {
                     onSaveCropRect = { newRect ->
                         saveLastCropRectToPrefs(newRect)
                     },
-                    onDismiss = {
-                        removeCropOverlay()
-                        if (!bitmap.isRecycled) {
-                            bitmap.recycle()
-                        }
-                        restoreFloatingButton()
-                    }
+                    onDismiss = dismissAction
                 )
             }
         }
 
-        cropOverlayView = composeView
-        windowManager.addView(composeView, overlayParams)
+        rootContainer.addView(
+            composeView,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        )
+
+        cropOverlayView = rootContainer
+        windowManager.addView(rootContainer, overlayParams)
+        rootContainer.requestFocus()
     }
 
     private fun saveLastCropRectToPrefs(rect: Rect) {
@@ -575,7 +737,7 @@ class FloatingWindowService : Service() {
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Screen Translator đang chạy")
-            .setContentText("Chạm 1 lần để khoanh vùng • Nhấp đúp để dịch lại vùng cũ")
+            .setContentText("Nhấn giữ nút A/V để bật Auto-Watch phụ đề")
             .setSmallIcon(android.R.drawable.ic_menu_camera)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setOngoing(true)
@@ -589,8 +751,10 @@ class FloatingWindowService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        stopAutoWatchLoop()
         idleDimJob?.cancel()
         singleTapJob?.cancel()
+        longPressJob?.cancel()
         snapAnimator?.cancel()
         serviceScope.cancel()
         removeCropOverlay()
