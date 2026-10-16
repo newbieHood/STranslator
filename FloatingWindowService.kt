@@ -9,18 +9,19 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.PixelFormat
-import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.os.SystemClock
 import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
@@ -29,6 +30,8 @@ import android.view.View
 import android.view.WindowManager
 import android.view.animation.DecelerateInterpolator
 import android.widget.FrameLayout
+import android.widget.Toast
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.platform.ComposeView
 import androidx.core.app.NotificationCompat
 import androidx.lifecycle.Lifecycle
@@ -62,13 +65,22 @@ class FloatingWindowService : Service() {
         const val EXTRA_RESULT_CODE = "EXTRA_RESULT_CODE"
         const val EXTRA_RESULT_DATA = "EXTRA_RESULT_DATA"
 
+        // Lưu trữ tọa độ khung khoanh gần nhất (Last Crop Rect)
+        private const val CROP_PREFS_NAME = "screen_translator_crop_prefs"
+        private const val KEY_HAS_LAST_RECT = "has_last_rect"
+        private const val KEY_RECT_LEFT = "rect_left"
+        private const val KEY_RECT_TOP = "rect_top"
+        private const val KEY_RECT_RIGHT = "rect_right"
+        private const val KEY_RECT_BOTTOM = "rect_bottom"
+
         // Cấu hình UI/UX cho Nút Nổi
         private const val BUTTON_SIZE_DP = 52f
         private const val EDGE_MARGIN_DP = 8f
         private const val TOP_SAFE_MARGIN_DP = 48f
-        private const val BOTTOM_NAV_SAFE_MARGIN_DP = 84f // Né thanh điều hướng 3 nút
-        private const val IDLE_TIMEOUT_MS = 3000L         // 3 giây không chạm sẽ tự mờ
-        private const val IDLE_ALPHA = 0.35f              // Độ mờ khi nghỉ (35%)
+        private const val BOTTOM_NAV_SAFE_MARGIN_DP = 84f
+        private const val IDLE_TIMEOUT_MS = 3000L
+        private const val IDLE_ALPHA = 0.35f
+        private const val DOUBLE_TAP_TIMEOUT_MS = 240L // Khoảng thời gian nhận diện nhấp đúp
     }
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -76,19 +88,29 @@ class FloatingWindowService : Service() {
     private lateinit var windowManager: WindowManager
     private lateinit var screenCaptureManager: ScreenCaptureManager
     private lateinit var translationManager: TranslationManager
+    private lateinit var cropPrefs: SharedPreferences
 
     private var floatingView: View? = null
+    private var iconCanvasView: View? = null
     private lateinit var floatingParams: WindowManager.LayoutParams
     private var cropOverlayView: ComposeView? = null
     private var activeComposeOwner: OverlayComposeLifecycleOwner? = null
 
+    // Biến lưu tọa độ khung khoanh gần nhất để dịch nhanh khi Nhấp đúp
+    private var lastCropRect: Rect? = null
+
     private var idleDimJob: Job? = null
+    private var singleTapJob: Job? = null
     private var snapAnimator: ValueAnimator? = null
     private var isCapturing = false
 
     override fun onCreate() {
         super.onCreate()
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        cropPrefs = getSharedPreferences(CROP_PREFS_NAME, Context.MODE_PRIVATE)
+
+        // Khôi phục tọa độ khung khoanh gần nhất từ lần sử dụng trước (nếu có)
+        lastCropRect = loadLastCropRectFromPrefs()
 
         screenCaptureManager = ScreenCaptureManager(
             context = this,
@@ -150,7 +172,6 @@ class FloatingWindowService : Service() {
 
         val button = createStyledFloatingButton(buttonSizePx)
 
-        // windowAnimations = 0 để tắt hiệu ứng fade-out mặc định của Samsung One UI 8.0
         floatingParams = WindowManager.LayoutParams(
             buttonSizePx,
             buttonSizePx,
@@ -169,19 +190,15 @@ class FloatingWindowService : Service() {
         floatingView = button
         windowManager.addView(floatingView, floatingParams)
 
-        // Kích hoạt bộ đếm 3 giây tự làm mờ ngay sau khi hiển thị
         scheduleIdleDimming()
     }
 
-    /**
-     * Thiết kế nút nổi hình tròn có viền xanh ánh kim và icon "A/V" + khung ngắm sắc nét
-     */
     private fun createStyledFloatingButton(sizePx: Int): View {
         val container = FrameLayout(this).apply {
             background = GradientDrawable().apply {
                 shape = GradientDrawable.OVAL
-                setColor(Color.parseColor("#E6162032")) // Nền xanh đen đậm bán trong suốt
-                setStroke(dpToPx(2f), Color.parseColor("#8AB4F8")) // Viền xanh sáng 2dp
+                setColor(Color.parseColor("#E6162032"))
+                setStroke(dpToPx(2f), Color.parseColor("#8AB4F8"))
             }
             elevation = dpToPx(6f).toFloat()
         }
@@ -201,7 +218,11 @@ class FloatingWindowService : Service() {
                 textAlign = Paint.Align.CENTER
             }
 
-            private val rectF = RectF()
+            // Chấm vàng nhỏ báo hiệu đã có vùng nhớ (sẵn sàng Nhấp đúp)
+            private val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.parseColor("#FDD663")
+                style = Paint.Style.FILL
+            }
 
             override fun onDraw(canvas: Canvas) {
                 super.onDraw(canvas)
@@ -210,46 +231,45 @@ class FloatingWindowService : Service() {
                 val pad = w * 0.24f
                 val cornerLen = w * 0.13f
 
-                // Vẽ 4 góc khung ngắm (Scan Viewfinder) bên trong nút tròn
-                // Góc trên - trái
+                // 4 góc khung ngắm
                 canvas.drawLine(pad, pad, pad + cornerLen, pad, cornerPaint)
                 canvas.drawLine(pad, pad, pad, pad + cornerLen, cornerPaint)
-                // Góc trên - phải
                 canvas.drawLine(w - pad, pad, w - pad - cornerLen, pad, cornerPaint)
                 canvas.drawLine(w - pad, pad, w - pad, pad + cornerLen, cornerPaint)
-                // Góc dưới - trái
                 canvas.drawLine(pad, h - pad, pad + cornerLen, h - pad, cornerPaint)
                 canvas.drawLine(pad, h - pad, pad, h - pad - cornerLen, cornerPaint)
-                // Góc dưới - phải
                 canvas.drawLine(w - pad, h - pad, w - pad - cornerLen, h - pad, cornerPaint)
                 canvas.drawLine(w - pad, h - pad, w - pad, h - pad - cornerLen, cornerPaint)
 
-                // Vẽ chữ "A/V" căn chính giữa tâm nút
+                // Chữ "A/V" ở tâm
                 val textY = h / 2f - (textPaint.descent() + textPaint.ascent()) / 2f
                 canvas.drawText("A/V", w / 2f, textY, textPaint)
+
+                // Nếu đã lưu tọa độ khung khoanh gần nhất, vẽ 1 chấm tròn vàng nhỏ dưới chữ A/V
+                if (lastCropRect != null) {
+                    canvas.drawCircle(w / 2f, h * 0.74f, dpToPx(2.2f).toFloat(), dotPaint)
+                }
             }
         }
 
-        container.addView(
-            iconView,
-            FrameLayout.LayoutParams(sizePx, sizePx)
-        )
+        iconCanvasView = iconView
+        container.addView(iconView, FrameLayout.LayoutParams(sizePx, sizePx))
         return container
     }
 
     /**
-     * Xử lý kéo thả, giữ trong vùng màn hình an toàn, tự động hít vào mép trái/phải và hẹn giờ làm mờ
+     * Phân biệt kéo thả, Chạm đơn (Khoanh vùng mới) và Nhấp đúp (Dịch lại vùng cũ)
      */
     private fun setupDragSnapAndClick(view: View) {
         var initialX = 0
         var initialY = 0
         var initialTouchX = 0f
         var initialTouchY = 0f
+        var lastTapUpTime = 0L
 
         view.setOnTouchListener { v, event ->
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
-                    // Đánh thức nút sáng rõ 100% ngay khi chạm vào
                     wakeUpFloatingButton(scaleUp = true)
                     snapAnimator?.cancel()
 
@@ -261,6 +281,13 @@ class FloatingWindowService : Service() {
                 }
 
                 MotionEvent.ACTION_MOVE -> {
+                    val deltaX = abs(event.rawX - initialTouchX)
+                    val deltaY = abs(event.rawY - initialTouchY)
+                    // Nếu người dùng bắt đầu kéo nút đi, hủy lệnh chờ chạm đơn (nếu có)
+                    if (deltaX >= 15 || deltaY >= 15) {
+                        singleTapJob?.cancel()
+                    }
+
                     val bounds = windowManager.maximumWindowMetrics.bounds
                     val screenWidth = bounds.width()
                     val screenHeight = bounds.height()
@@ -283,7 +310,6 @@ class FloatingWindowService : Service() {
                 }
 
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                    // Trả kích thước nút về chuẩn 1.0x
                     v.animate().scaleX(1f).scaleY(1f).setDuration(120).start()
 
                     val deltaX = abs(event.rawX - initialTouchX)
@@ -291,9 +317,34 @@ class FloatingWindowService : Service() {
 
                     if (event.actionMasked == MotionEvent.ACTION_UP && deltaX < 15 && deltaY < 15) {
                         v.performClick()
-                        triggerScreenCapture()
+                        val now = SystemClock.uptimeMillis()
+
+                        if (now - lastTapUpTime <= DOUBLE_TAP_TIMEOUT_MS) {
+                            // PHÁT HIỆN NHẤP ĐÚP (Double-Tap): Hủy chạm đơn, dịch ngay vùng nhớ cũ
+                            singleTapJob?.cancel()
+                            lastTapUpTime = 0L
+
+                            if (lastCropRect != null) {
+                                triggerScreenCapture(useSavedRect = true)
+                            } else {
+                                Toast.makeText(
+                                    this@FloatingWindowService,
+                                    "Chưa có vùng nhớ. Hãy kéo khoanh vùng lần đầu!",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                                triggerScreenCapture(useSavedRect = false)
+                            }
+                        } else {
+                            // CHẠM LẦN 1: Chờ 240ms xem người dùng có chạm tiếp lần 2 không
+                            lastTapUpTime = now
+                            singleTapJob?.cancel()
+                            singleTapJob = serviceScope.launch {
+                                delay(DOUBLE_TAP_TIMEOUT_MS)
+                                lastTapUpTime = 0L
+                                triggerScreenCapture(useSavedRect = false)
+                            }
+                        }
                     } else {
-                        // Tự động hít vào cạnh trái hoặc phải gần nhất và hẹn 3 giây tự mờ
                         snapToNearestEdge(v)
                         scheduleIdleDimming()
                     }
@@ -305,9 +356,6 @@ class FloatingWindowService : Service() {
         }
     }
 
-    /**
-     * Hiệu ứng trượt mượt về mép Trái hoặc Phải gần nhất khi người dùng thả tay
-     */
     private fun snapToNearestEdge(view: View) {
         val bounds = windowManager.maximumWindowMetrics.bounds
         val screenWidth = bounds.width()
@@ -335,9 +383,6 @@ class FloatingWindowService : Service() {
         }
     }
 
-    /**
-     * Khôi phục độ sáng 100% khi người dùng chạm vào nút
-     */
     private fun wakeUpFloatingButton(scaleUp: Boolean = false) {
         idleDimJob?.cancel()
         floatingView?.let { v ->
@@ -353,9 +398,6 @@ class FloatingWindowService : Service() {
         }
     }
 
-    /**
-     * Tự động giảm độ mờ xuống 35% sau 3 giây không tương tác để không che khuất game
-     */
     private fun scheduleIdleDimming() {
         idleDimJob?.cancel()
         idleDimJob = serviceScope.launch {
@@ -374,27 +416,27 @@ class FloatingWindowService : Service() {
     }
 
     /**
-     * Quy trình chụp màn hình an toàn:
-     * Hủy mọi hiệu ứng của nút nổi -> Ẩn tức thì (View.GONE) -> Chờ 90ms -> Chụp màn hình
+     * Chụp màn hình với tùy chọn:
+     * - useSavedRect = false (Chạm 1 lần): Mở màn hình để người dùng tự kéo chọn vùng mới.
+     * - useSavedRect = true (Nhấp đúp): Áp dụng ngay lastCropRect để dịch tức thì.
      */
-    private fun triggerScreenCapture() {
+    private fun triggerScreenCapture(useSavedRect: Boolean) {
         if (isCapturing || !screenCaptureManager.isReady) return
         isCapturing = true
 
         serviceScope.launch {
             try {
-                // Hủy ngay mọi Animator để nút biến mất tức thì, tuyệt đối không lưu bóng mờ trên One UI 8.0
                 idleDimJob?.cancel()
                 snapAnimator?.cancel()
                 floatingView?.animate()?.cancel()
                 floatingView?.visibility = View.GONE
 
-                // Chờ 90ms để màn hình cập nhật khung hình mới không có nút nổi
                 delay(90)
 
                 val bitmap = screenCaptureManager.captureScreen()
                 if (bitmap != null) {
-                    onCaptureSuccess(bitmap)
+                    val autoRect = if (useSavedRect) lastCropRect else null
+                    onCaptureSuccess(bitmap, autoRect)
                 } else {
                     restoreFloatingButton()
                 }
@@ -411,10 +453,11 @@ class FloatingWindowService : Service() {
             v.scaleY = 1.0f
             v.visibility = View.VISIBLE
         }
+        iconCanvasView?.invalidate()
         scheduleIdleDimming()
     }
 
-    private fun onCaptureSuccess(bitmap: Bitmap) {
+    private fun onCaptureSuccess(bitmap: Bitmap, autoCropRect: Rect?) {
         removeCropOverlay()
 
         val overlayParams = WindowManager.LayoutParams(
@@ -446,12 +489,15 @@ class FloatingWindowService : Service() {
                 CropOverlayScreen(
                     screenshotBitmap = bitmap,
                     translationManager = translationManager,
+                    initialCropRect = autoCropRect,
+                    onSaveCropRect = { newRect ->
+                        saveLastCropRectToPrefs(newRect)
+                    },
                     onDismiss = {
                         removeCropOverlay()
                         if (!bitmap.isRecycled) {
                             bitmap.recycle()
                         }
-                        // Hiện lại nút nổi và bắt đầu đếm 3 giây tự làm mờ
                         restoreFloatingButton()
                     }
                 )
@@ -460,6 +506,29 @@ class FloatingWindowService : Service() {
 
         cropOverlayView = composeView
         windowManager.addView(composeView, overlayParams)
+    }
+
+    private fun saveLastCropRectToPrefs(rect: Rect) {
+        lastCropRect = rect
+        cropPrefs.edit()
+            .putBoolean(KEY_HAS_LAST_RECT, true)
+            .putFloat(KEY_RECT_LEFT, rect.left)
+            .putFloat(KEY_RECT_TOP, rect.top)
+            .putFloat(KEY_RECT_RIGHT, rect.right)
+            .putFloat(KEY_RECT_BOTTOM, rect.bottom)
+            .apply()
+        iconCanvasView?.invalidate()
+    }
+
+    private fun loadLastCropRectFromPrefs(): Rect? {
+        if (!cropPrefs.getBoolean(KEY_HAS_LAST_RECT, false)) return null
+        val left = cropPrefs.getFloat(KEY_RECT_LEFT, 0f)
+        val top = cropPrefs.getFloat(KEY_RECT_TOP, 0f)
+        val right = cropPrefs.getFloat(KEY_RECT_RIGHT, 0f)
+        val bottom = cropPrefs.getFloat(KEY_RECT_BOTTOM, 0f)
+        return if (right - left >= 40f && bottom - top >= 40f) {
+            Rect(left, top, right, bottom)
+        } else null
     }
 
     private fun removeCropOverlay() {
@@ -506,7 +575,7 @@ class FloatingWindowService : Service() {
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Screen Translator đang chạy")
-            .setContentText("Chạm vào nút nổi A/V để khoanh vùng dịch")
+            .setContentText("Chạm 1 lần để khoanh vùng • Nhấp đúp để dịch lại vùng cũ")
             .setSmallIcon(android.R.drawable.ic_menu_camera)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setOngoing(true)
@@ -521,6 +590,7 @@ class FloatingWindowService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         idleDimJob?.cancel()
+        singleTapJob?.cancel()
         snapAnimator?.cancel()
         serviceScope.cancel()
         removeCropOverlay()
