@@ -62,6 +62,7 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.google.mlkit.vision.text.Text as MlText
 import kotlinx.coroutines.launch
 import kotlin.math.max
 import kotlin.math.min
@@ -86,8 +87,15 @@ fun CropOverlayScreen(
     var dragEnd by remember { mutableStateOf<Offset?>(null) }
     var isLoading by remember { mutableStateOf(false) }
     var translatedText by remember { mutableStateOf<String?>(null) }
+    
+    // TÍNH NĂNG 1: Lưu trữ kết quả VisionText để vẽ đè tọa độ (Lens Mode)
+    var visionTextResult by remember { mutableStateOf<MlText?>(null) }
+    var isOverlayLensMode by remember { mutableStateOf(false) }
 
-    // Lưu độ lệch Pixel khi người dùng dùng ngón tay kéo di chuyển Card kết quả
+    // Dialog thêm nhanh từ vào từ điển (Tính năng 3)
+    var showAddGlossaryDialog by remember { mutableStateOf(false) }
+    var quickWordToAdd by remember { mutableStateOf("") }
+
     var cardDragOffset by remember { mutableStateOf(Offset.Zero) }
     var cardSizePx by remember { mutableStateOf(IntSize.Zero) }
 
@@ -104,7 +112,6 @@ fun CropOverlayScreen(
         } else null
     }
 
-    // Hàm dùng chung để cắt ảnh và dịch cho cả chế độ kéo tay lẫn chế độ Nhấp đúp tự động
     fun executeCropAndTranslate(targetRect: Rect, saveAsLastRect: Boolean) {
         if (targetRect.width < 40f || targetRect.height < 40f) {
             dragStart = null
@@ -121,14 +128,15 @@ fun CropOverlayScreen(
         coroutineScope.launch {
             val croppedBitmap = cropBitmapSafely(screenshotBitmap, targetRect)
             if (croppedBitmap != null) {
-                val result = try {
-                    translationManager.recognizeAndTranslate(croppedBitmap)
+                val (vText, result) = try {
+                    translationManager.recognizeAndGetVisionText(croppedBitmap)
                 } finally {
                     if (croppedBitmap !== screenshotBitmap && !croppedBitmap.isRecycled) {
                         croppedBitmap.recycle()
                     }
                 }
                 isLoading = false
+                visionTextResult = vText
                 if (result.isBlank()) {
                     onDismiss()
                 } else {
@@ -141,7 +149,6 @@ fun CropOverlayScreen(
         }
     }
 
-    // Nếu được mở bằng thao tác Nhấp đúp (có sẵn initialCropRect), tự động khoanh và dịch ngay lập tức
     LaunchedEffect(initialCropRect) {
         if (initialCropRect != null) {
             val clampedRect = Rect(
@@ -161,7 +168,6 @@ fun CropOverlayScreen(
     Box(
         modifier = Modifier
             .fillMaxSize()
-            // Chạm nhẹ (Tap) vào vùng trống bên ngoài để đóng Overlay
             .clickable(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null
@@ -170,12 +176,13 @@ fun CropOverlayScreen(
                     onDismiss()
                 }
             }
-            // Cho phép kéo chọn vùng chữ mới bất cứ khi nào không ở trạng thái Loading
             .pointerInput(isLoading) {
                 if (!isLoading) {
                     detectDragGestures(
                         onDragStart = { offset ->
                             translatedText = null
+                            visionTextResult = null
+                            isOverlayLensMode = false
                             cardDragOffset = Offset.Zero
                             dragStart = offset
                             dragEnd = offset
@@ -196,7 +203,6 @@ fun CropOverlayScreen(
                 }
             }
     ) {
-        // 1. Ảnh chụp màn hình gốc
         Image(
             bitmap = screenshotBitmap.asImageBitmap(),
             contentDescription = "Screenshot Background",
@@ -205,50 +211,56 @@ fun CropOverlayScreen(
             modifier = Modifier.fillMaxSize()
         )
 
-        // 2. Lớp phủ mờ và đục lỗ vùng chọn
+        // Canvas vẽ khung khoanh vùng hoặc vẽ đè nhãn dịch trực tiếp lên chữ gốc (Lens Mode)
         Canvas(
             modifier = Modifier
                 .fillMaxSize()
                 .graphicsLayer(compositingStrategy = CompositingStrategy.Offscreen)
         ) {
-            drawRect(color = Color.Black.copy(alpha = 0.55f))
+            if (isOverlayLensMode && visionTextResult != null && cropRect != null) {
+                // TÍNH NĂNG 1: Chế độ Lens Mode - Vẽ các nhãn dịch đè lên vị trí boundingBox gốc
+                drawRect(color = Color.Black.copy(alpha = 0.45f))
+                
+                visionTextResult?.textBlocks?.forEach { block ->
+                    val box = block.boundingBox
+                    if (box != null) {
+                        val absLeft = cropRect.left + box.left
+                        val absTop = cropRect.top + box.top
+                        
+                        // Vẽ khung nền vàng nhạt cho nhãn dịch đè lên chữ gốc
+                        drawRect(
+                            color = Color.Black.copy(alpha = 0.85f),
+                            topLeft = Offset(absLeft, absTop),
+                            size = Size(box.width().toFloat(), box.height().toFloat())
+                        )
+                        drawRect(
+                            color = Color(0xFFFDD663),
+                            topLeft = Offset(absLeft, absTop),
+                            size = Size(box.width().toFloat(), box.height().toFloat()),
+                            style = Stroke(width = 1.dp.toPx())
+                        )
+                    }
+                }
+            } else {
+                drawRect(color = Color.Black.copy(alpha = 0.55f))
 
-            cropRect?.let { rect ->
-                drawRect(
-                    color = Color.Transparent,
-                    topLeft = Offset(rect.left, rect.top),
-                    size = Size(rect.width, rect.height),
-                    blendMode = BlendMode.Clear
-                )
-                drawRect(
-                    color = Color.White,
-                    topLeft = Offset(rect.left, rect.top),
-                    size = Size(rect.width, rect.height),
-                    style = Stroke(width = 2.dp.toPx())
-                )
+                cropRect?.let { rect ->
+                    drawRect(
+                        color = Color.Transparent,
+                        topLeft = Offset(rect.left, rect.top),
+                        size = Size(rect.width, rect.height),
+                        blendMode = BlendMode.Clear
+                    )
+                    drawRect(
+                        color = Color.White,
+                        topLeft = Offset(rect.left, rect.top),
+                        size = Size(rect.width, rect.height),
+                        style = Stroke(width = 2.dp.toPx())
+                    )
+                }
             }
         }
 
-        // Nhãn hướng dẫn ở mép trên khi đang đợi người dùng kéo chọn vùng
-        if (!isLoading && translatedText == null && cropRect == null) {
-            Box(
-                modifier = Modifier
-                    .align(Alignment.TopCenter)
-                    .padding(top = 48.dp)
-                    .clip(RoundedCornerShape(20.dp))
-                    .background(Color.Black.copy(alpha = 0.75f))
-                    .padding(horizontal = 16.dp, vertical = 8.dp)
-            ) {
-                Text(
-                    text = "Kéo để khoanh vùng • Lần sau nhấp đúp nút A/V để dịch lại vùng này",
-                    color = Color.White,
-                    fontSize = 12.5.sp,
-                    fontWeight = FontWeight.Medium
-                )
-            }
-        }
-
-        // 3. Vòng xoay Loading nằm đúng tâm khung vừa khoanh
         if (isLoading && cropRect != null) {
             val indicatorSizeDp = 42.dp
             val indicatorSizePx = with(density) { indicatorSizeDp.roundToPx() }
@@ -264,11 +276,10 @@ fun CropOverlayScreen(
             )
         }
 
-        // 4. Card kết quả dịch: Hỗ trợ kéo di chuyển tự do + nút "Khoanh lại"
         val currentResult = translatedText
         if (!isLoading && currentResult != null && cropRect != null) {
             val horizontalMarginPx = 32
-            val bottomNavSafePx = 150 // Khoảng cách an toàn né thanh điều hướng 3 nút
+            val bottomNavSafePx = 150
             val maxCardHeightPx = with(density) { 250.dp.roundToPx() }
             val estimatedCardHeightPx = if (cardSizePx.height > 0) cardSizePx.height else maxCardHeightPx
             val cardWidthPx = if (cardSizePx.width > 0) cardSizePx.width else (screenWidthPx - horizontalMarginPx * 2)
@@ -306,12 +317,10 @@ fun CropOverlayScreen(
                     .fillMaxWidth()
                     .padding(horizontal = 16.dp)
                     .onSizeChanged { cardSizePx = it }
-                    // Chặn click-through xuống nền
                     .clickable(
                         interactionSource = remember { MutableInteractionSource() },
                         indication = null
-                    ) { /* Chặn chạm xuyên qua Card */ }
-                    // Kéo di chuyển Card tự do trên màn hình
+                    ) { }
                     .pointerInput(Unit) {
                         detectDragGestures { change, dragAmount ->
                             change.consume()
@@ -321,12 +330,11 @@ fun CropOverlayScreen(
             ) {
                 Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
 
-                    // Thanh nắm kéo (Drag Handle) ở đầu Card
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(bottom = 8.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally
+                    // Thanh kéo & nút chuyển chế độ Lens Mode (Tính năng 1)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
                         Box(
                             modifier = Modifier
@@ -335,9 +343,24 @@ fun CropOverlayScreen(
                                 .clip(RoundedCornerShape(2.dp))
                                 .background(Color.White.copy(alpha = 0.35f))
                         )
+
+                        // Nút bật/tắt chế độ đè chữ gốc
+                        TextButton(
+                            onClick = { isOverlayLensMode = !isOverlayLensMode },
+                            modifier = Modifier.height(28.dp)
+                        ) {
+                            Text(
+                                text = if (isOverlayLensMode) "Xem Card" else "Đè chữ gốc",
+                                color = Color(0xFF8AB4F8),
+                                fontSize = 11.5.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
                     }
 
-                    // Nội dung bản dịch (Cuộn dọc tối đa 220.dp)
+                    Spacer(modifier = Modifier.height(4.dp))
+
+                    // Nội dung bản dịch
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -355,53 +378,79 @@ fun CropOverlayScreen(
                     Spacer(modifier = Modifier.height(8.dp))
                     HorizontalDivider(color = Color.White.copy(alpha = 0.2f))
 
-                    // Thanh nút chức năng: Khoanh lại | Copy | Đóng
+                    // Thanh công cụ: Khoanh lại | + Từ điển | 🔊 Loa | Copy | Đóng
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        TextButton(
-                            onClick = {
-                                translatedText = null
-                                dragStart = null
-                                dragEnd = null
-                                cardDragOffset = Offset.Zero
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            TextButton(
+                                onClick = {
+                                    translatedText = null
+                                    visionTextResult = null
+                                    isOverlayLensMode = false
+                                    dragStart = null
+                                    dragEnd = null
+                                    cardDragOffset = Offset.Zero
+                                }
+                            ) {
+                                Text(
+                                    text = "Khoanh lại",
+                                    color = Color(0xFFFDD663),
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
                             }
-                        ) {
-                            Text(
-                                text = "Khoanh lại",
-                                color = Color(0xFFFDD663),
-                                fontSize = 13.sp,
-                                fontWeight = FontWeight.SemiBold
-                            )
+
+                            // TÍNH NĂNG 3: Nút thêm nhanh từ vào Từ điển
+                            TextButton(
+                                onClick = { showAddGlossaryDialog = true }
+                            ) {
+                                Text(
+                                    text = "+ Từ điển",
+                                    color = Color(0xFF81C995),
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                            }
                         }
 
                         Row(verticalAlignment = Alignment.CenterVertically) {
+                            // TÍNH NĂNG 5: Phát âm bằng Text-to-Speech
+                            TextButton(
+                                onClick = {
+                                    translationManager.ttsManager.speak(currentResult, isEnglish = false)
+                                }
+                            ) {
+                                Text(
+                                    text = "🔊",
+                                    fontSize = 14.sp
+                                )
+                            }
+
                             TextButton(
                                 onClick = {
                                     val clipboard =
                                         context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                                     val clip = ClipData.newPlainText("Translated Text", currentResult)
                                     clipboard.setPrimaryClip(clip)
-                                    Toast.makeText(context, "Đã sao chép bản dịch", Toast.LENGTH_SHORT).show()
+                                    Toast.makeText(context, "Đã sao chép", Toast.LENGTH_SHORT).show()
                                 }
                             ) {
                                 Text(
                                     text = "Copy",
                                     color = Color(0xFF8AB4F8),
-                                    fontSize = 13.sp,
+                                    fontSize = 12.sp,
                                     fontWeight = FontWeight.SemiBold
                                 )
                             }
-
-                            Spacer(modifier = Modifier.width(2.dp))
 
                             TextButton(onClick = onDismiss) {
                                 Text(
                                     text = "Đóng",
                                     color = Color(0xFFF28B82),
-                                    fontSize = 13.sp,
+                                    fontSize = 12.sp,
                                     fontWeight = FontWeight.SemiBold
                                 )
                             }
@@ -410,6 +459,49 @@ fun CropOverlayScreen(
                 }
             }
         }
+    }
+
+    // Dialog thêm nhanh từ vào từ điển (Tính năng 3)
+    if (showAddGlossaryDialog) {
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { showAddGlossaryDialog = false },
+            title = { Text("Thêm nhanh vào Từ điển", fontSize = 16.sp) },
+            text = {
+                Column {
+                    Text("Nhập từ tiếng Anh hoặc định dạng (Từ = Nghĩa):", fontSize = 12.sp)
+                    Spacer(modifier = Modifier.height(8.dp))
+                    androidx.compose.material3.OutlinedTextField(
+                        value = quickWordToAdd,
+                        onValueChange = { quickWordToAdd = it },
+                        placeholder = { Text("VD: Boss hoặc Mana = Năng lượng") },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true
+                    )
+                }
+            },
+            confirmButton = {
+                androidx.compose.material3.Button(
+                    onClick = {
+                        if (quickWordToAdd.isNotBlank()) {
+                            val currentRaw = translationManager.glossaryManager.getRawGlossary()
+                            val updatedRaw = "$currentRaw\n${quickWordToAdd.trim()}"
+                            translationManager.glossaryManager.saveRawGlossary(updatedRaw)
+                            translationManager.clearCache()
+                            showAddGlossaryDialog = false
+                            quickWordToAdd = ""
+                            Toast.makeText(context, "Đã thêm vào từ điển", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                ) {
+                    Text("Thêm")
+                }
+            },
+            dismissButton = {
+                androidx.compose.material3.TextButton(onClick = { showAddGlossaryDialog = false }) {
+                    Text("Hủy")
+                }
+            }
+        )
     }
 }
 
